@@ -174,3 +174,34 @@ export async function getStorageEstimate(): Promise<{ usage: number; quota: numb
   }
   return { usage: 0, quota: 0 };
 }
+
+/**
+ * Recursively collect all files from a group's workspace.
+ * Returns an array of { path, content } entries.
+ */
+export async function collectAllGroupFiles(
+  groupId: string,
+): Promise<{ path: string; content: string }[]> {
+  const groupDir = await getGroupDir(groupId);
+  const results: { path: string; content: string }[] = [];
+
+  async function walk(dir: FileSystemDirectoryHandle, prefix: string) {
+    for await (const [name, handle] of dir.entries()) {
+      const entryPath = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') {
+        await walk(handle as FileSystemDirectoryHandle, entryPath);
+      } else {
+        try {
+          const file = await (handle as FileSystemFileHandle).getFile();
+          const content = await file.text();
+          results.push({ path: entryPath, content });
+        } catch {
+          // skip unreadable files
+        }
+      }
+    }
+  }
+
+  await walk(groupDir, '');
+  return results;
+}

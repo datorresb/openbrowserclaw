@@ -40,6 +40,57 @@ self.onmessage = async (event: MessageEvent<WorkerInbound>) => {
 // Shell emulator needs no boot — it's pure JS over OPFS
 
 // ---------------------------------------------------------------------------
+// Message sanitization — ensure tool_use/tool_result pairing
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip tool_use blocks from an assistant content array.
+ * Used when the model returned tool_use blocks but stop_reason != 'tool_use'
+ * (e.g. stop_reason === 'max_tokens' mid-tool-call).
+ */
+function stripToolUseBlocks(content: any[]): any[] {
+  const filtered = content.filter((b: any) => b.type !== 'tool_use');
+  return filtered.length > 0 ? filtered : [{ type: 'text', text: '' }];
+}
+
+/**
+ * Ensure every assistant message with tool_use blocks is followed by a user
+ * message with matching tool_result blocks. Orphaned tool_use blocks are
+ * stripped to prevent Anthropic API 400 errors.
+ */
+function sanitizeMessages(messages: ConversationMessage[]): ConversationMessage[] {
+  const result: ConversationMessage[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    // Check assistant messages with tool_use blocks
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      const toolUseIds = msg.content
+        .filter((b: any) => b.type === 'tool_use')
+        .map((b: any) => b.id);
+
+      if (toolUseIds.length > 0) {
+        // Check if next message has matching tool_results
+        const next = messages[i + 1];
+        const hasResults = next?.role === 'user' && Array.isArray(next.content) &&
+          next.content.some((b: any) => b.type === 'tool_result');
+
+        if (!hasResults) {
+          // Strip orphaned tool_use blocks — keep only text
+          result.push({ ...msg, content: stripToolUseBlocks(msg.content) });
+          continue;
+        }
+      }
+    }
+
+    result.push(msg);
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Agent invocation — tool-use loop
 // ---------------------------------------------------------------------------
 
@@ -56,7 +107,20 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
     let currentMessages: ConversationMessage[] = [...messages];
     let iterations = 0;
     let hasUsedTools = false; // Track if any tool has been called in this invocation
-    const maxIterations = 25; // Safety limit to prevent infinite loops
+    const maxIterations = 30; // Safety limit — pause & resume handles longer tasks
+
+    // Loop detection — track recent tool calls to catch repetitive patterns
+    const recentToolCalls: string[] = []; // "toolName:inputHash" signatures
+    const LOOP_THRESHOLD = 3; // same tool+input 3 times → break the loop
+
+    // Extract the original user request (last user message) for nudge context
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+    const userTask = typeof lastUserMsg?.content === 'string'
+      ? lastUserMsg.content
+      : Array.isArray(lastUserMsg?.content)
+        ? lastUserMsg.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join(' ')
+        : '';
+    const taskSnippet = userTask.length > 300 ? userTask.slice(0, 300) + '…' : userTask;
 
     while (iterations < maxIterations) {
       iterations++;
@@ -66,7 +130,7 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
         max_tokens: maxTokens,
         cache_control: { type: 'ephemeral' },
         system: systemPrompt,
-        messages: currentMessages,
+        messages: sanitizeMessages(currentMessages),
         tools: TOOL_DEFINITIONS,
       };
 
@@ -121,11 +185,11 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
 
       if (result.stop_reason === 'tool_use') {
         if (!hasUsedTools) {
-          // First time using tools — reset nudge counter so post-tool
-          // auto-continues get a fresh budget (initial nudges don't eat into it)
           hasUsedTools = true;
-          autoContinueCount = 0;
         }
+        // Reset nudge counter every time tools run successfully —
+        // so text-only responses AFTER tools always get a fresh nudge budget
+        autoContinueCount = 0;
         // Execute all tool calls
         const toolResults = [];
         for (const block of result.content) {
@@ -160,6 +224,30 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
           }
         }
 
+        // --- Loop detection ---
+        // Track tool call signatures; if same tool+input appears LOOP_THRESHOLD
+        // times, the model is stuck (e.g. retrying a blocked search engine).
+        for (const block of result.content) {
+          if (block.type === 'tool_use') {
+            const sig = `${block.name}:${JSON.stringify(block.input).slice(0, 200)}`;
+            recentToolCalls.push(sig);
+          }
+        }
+        // Count occurrences of most recent call
+        const lastSig = recentToolCalls[recentToolCalls.length - 1];
+        const repeatCount = recentToolCalls.filter(s => s === lastSig).length;
+        if (repeatCount >= LOOP_THRESHOLD) {
+          log(groupId, 'info', 'Loop detected', `Tool "${lastSig.split(':')[0]}" called ${repeatCount}× with same input — stopping`);
+          post({
+            type: 'response',
+            payload: {
+              groupId,
+              text: `I tried the same approach ${repeatCount} times without success. Let me know if you'd like me to try a different strategy.`,
+            },
+          });
+          return;
+        }
+
         // Continue the conversation with tool results
         currentMessages.push({ role: 'assistant', content: result.content });
         currentMessages.push({ role: 'user', content: toolResults as any });
@@ -176,15 +264,21 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
         const cleaned = text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 
         // Check if the model stopped mid-task (wants to continue but didn't use tools)
-        // Strategy: If no tools have been called AT ALL in this invocation,
-        // always nudge — the model is describing instead of acting.
-        // After tools have run, nudge if response is empty (model froze).
+        // Strategy:
+        //  - No tools used yet → always nudge (model is describing instead of acting)
+        //  - Tools used, empty response → nudge (model froze)
+        //  - Tools used, text response mid-run → nudge (model said "I'll do X" instead of doing it)
+        //    Only accept text as final if it looks like a genuine completion (iteration > 2
+        //    and we've already used tools — give the model 1 chance to self-correct)
         const isEmptyResponse = !cleaned;
+        const isMidTaskDescription = hasUsedTools && !isEmptyResponse && autoContinueCount < 2;
         const shouldNudge = autoContinueCount < MAX_AUTO_CONTINUES && (
           // No tools used yet in this entire invocation — keep pushing
           !hasUsedTools ||
           // Empty response after tools ran — model froze, nudge it
-          isEmptyResponse
+          isEmptyResponse ||
+          // Model returned text mid-task instead of calling another tool — nudge once
+          isMidTaskDescription
         );
 
         if (iterations < maxIterations && shouldNudge) {
@@ -195,15 +289,21 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
             : 'Model returned text without tool calls — nudging to act';
           log(groupId, 'info', 'Auto-continue', reason);
 
-          // Escalating nudge messages — get progressively more forceful
+          // Escalating nudge messages — include original task so model doesn't lose context
+          const taskReminder = taskSnippet
+            ? `\nReminder — the user's request: "${taskSnippet}"`
+            : '';
+
           const nudgeMessages = [
-            'Continue — use the tools to complete the task.',
-            'You must use a tool now. Pick the most relevant one and invoke it.',
-            'Your next message MUST be a tool call, not text.',
+            `Do not describe what you will do. Use tools now to fulfill the request.${taskReminder}`,
+            `You must call a tool right now. Pick the most relevant tool and invoke it.${taskReminder}`,
+            `Your next message MUST be a tool call, not text. Act immediately.${taskReminder}`,
           ];
           const nudgeIdx = Math.min(autoContinueCount - 1, nudgeMessages.length - 1);
 
-          currentMessages.push({ role: 'assistant', content: result.content });
+          // Strip any tool_use blocks — this is a text/nudge path, not a tool execution path
+          const safeContent = stripToolUseBlocks(result.content);
+          currentMessages.push({ role: 'assistant', content: safeContent });
           currentMessages.push({
             role: 'user',
             content: !cleaned
@@ -215,22 +315,91 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
           continue; // Re-enter the loop
         }
 
+        // If tools were used during this invocation, auto-save progress to MEMORY.md
+        // so that if the user says "continue", the model knows what was done
+        if (hasUsedTools && iterations > 2) {
+          await saveProgressToMemory(groupId, taskSnippet, iterations, recentToolCalls);
+        }
+
         post({ type: 'response', payload: { groupId, text: cleaned || (iterations > 1 ? '' : '(no response)') } });
         return;
       }
     }
 
-    // If we hit max iterations
+    // If we hit max iterations — save progress to memory and invite user to continue
+    log(groupId, 'info', 'Paused', `Reached ${maxIterations} iterations — saving progress to memory`);
+
+    const toolSummary = buildToolSummary(recentToolCalls);
+    await saveProgressToMemory(groupId, taskSnippet, iterations, recentToolCalls);
+
     post({
       type: 'response',
       payload: {
         groupId,
-        text: '⚠️ Reached maximum tool-use iterations (25). Stopping to avoid excessive API usage.',
+        text: `I've used ${iterations} tool calls so far (${toolSummary}). I saved my progress to memory. Say **"continue"** and I'll pick up where I left off.`,
       },
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     post({ type: 'error', payload: { groupId, error: message } });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Progress auto-save helpers
+// ---------------------------------------------------------------------------
+
+function buildToolSummary(recentToolCalls: string[]): string {
+  const counts = recentToolCalls
+    .map(sig => sig.split(':')[0])
+    .reduce((acc: Record<string, number>, tool) => { acc[tool] = (acc[tool] || 0) + 1; return acc; }, {});
+  return Object.entries(counts)
+    .map(([tool, count]) => `${tool} (${count}×)`)
+    .join(', ');
+}
+
+/**
+ * Save a progress note to MEMORY.md so the model can resume on the next invocation.
+ * Replaces any previous in-progress note.
+ */
+async function saveProgressToMemory(
+  groupId: string,
+  taskSnippet: string,
+  iterations: number,
+  recentToolCalls: string[],
+): Promise<void> {
+  const toolSummary = buildToolSummary(recentToolCalls);
+
+  // List files created/written during this run
+  const filesWritten = recentToolCalls
+    .filter(sig => sig.startsWith('write_file:'))
+    .map(sig => {
+      try { return JSON.parse(sig.slice('write_file:'.length)).path; } catch { return null; }
+    })
+    .filter(Boolean);
+  const filesLine = filesWritten.length > 0
+    ? `Files created: ${[...new Set(filesWritten)].join(', ')}`
+    : '';
+
+  const progressNote = [
+    `## In-Progress Task (saved at ${new Date().toISOString()})`,
+    `Task: ${taskSnippet || '(unknown)'}`,
+    `Progress: ${iterations} iterations, tools used: ${toolSummary}`,
+    filesLine,
+    `Status: If user says "continue", resume from where you left off. Do NOT repeat work already done — read the files first.`,
+  ].filter(Boolean).join('\n');
+
+  try {
+    let existingMemory = '';
+    try {
+      existingMemory = await readGroupFile(groupId, 'MEMORY.md');
+    } catch { /* no memory yet */ }
+    // Remove any previous in-progress note
+    const cleaned = existingMemory.replace(/## In-Progress Task \(saved[\s\S]*?(?=##|$)/g, '').trim();
+    const updatedMemory = cleaned ? `${cleaned}\n\n${progressNote}` : progressNote;
+    await writeGroupFile(groupId, 'MEMORY.md', updatedMemory);
+  } catch {
+    // Memory save failed — not critical
   }
 }
 
@@ -346,6 +515,47 @@ async function executeTool(
         return entries.length > 0 ? entries.join('\n') : '(empty directory)';
       }
 
+      case 'web_search': {
+        const query = input.query as string;
+        if (!query) return 'Error: missing "query" parameter';
+
+        const encoded = encodeURIComponent(query);
+        // Bing works well with server-side fetch (no JS required).
+        // Google requires JS rendering — doesn't work with plain HTTP.
+        const engines = [
+          { name: 'Bing',     url: `https://www.bing.com/search?q=${encoded}` },
+          { name: 'Google',   url: `https://www.google.com/search?q=${encoded}&num=10&hl=en&gbv=1` },
+        ];
+
+        for (const engine of engines) {
+          try {
+            const searchRes = await fetch(CORS_PROXY_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: engine.url, method: 'GET' }),
+            });
+
+            if (!searchRes.ok) continue;
+
+            const html = await searchRes.text();
+            const text = stripHtml(html);
+
+            // Check if we got a CAPTCHA / bot block
+            if (text.includes('unusual traffic') || text.includes('not a robot') ||
+                text.includes('complete the following challenge') || text.length < 200) {
+              log(groupId, 'info', 'Search blocked', `${engine.name} returned a CAPTCHA, trying next engine`);
+              continue;
+            }
+
+            return `[${engine.name} results for "${query}"]\n${text.slice(0, FETCH_MAX_RESPONSE)}`;
+          } catch {
+            continue;
+          }
+        }
+
+        return `Search failed — all engines blocked or unavailable for query: "${query}". Try using fetch_url with a known URL instead.`;
+      }
+
       case 'fetch_url': {
         const targetUrl = input.url as string;
         const method = (input.method as string) || 'GET';
@@ -387,7 +597,7 @@ async function executeTool(
       }
 
       case 'update_memory':
-        await writeGroupFile(groupId, 'CLAUDE.md', input.content as string);
+        await writeGroupFile(groupId, 'MEMORY.md', input.content as string);
         return 'Memory updated successfully.';
 
       case 'create_task': {

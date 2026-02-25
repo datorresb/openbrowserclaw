@@ -98,7 +98,7 @@ Open `http://localhost:5173`, go to **Settings**, select **GitHub Copilot Proxy*
 | `javascript` | Execute JS code in an isolated scope (lighter than bash) |
 | `read_file` / `write_file` / `list_files` | Manage files in OPFS per-group workspace |
 | `fetch_url` | HTTP requests via browser `fetch()` (subject to CORS) |
-| `update_memory` | Persist context to CLAUDE.md (loaded on every conversation) |
+| `update_memory` | Persist context to MEMORY.md (loaded on every conversation) |
 | `create_task` | Schedule recurring tasks with cron expressions |
 
 ## Telegram

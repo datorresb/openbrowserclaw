@@ -357,7 +357,7 @@ export class Orchestrator {
     // Load group memory
     let memory = '';
     try {
-      memory = await readGroupFile(groupId, 'CLAUDE.md');
+      memory = await readGroupFile(groupId, 'MEMORY.md');
     } catch {
       // No memory file yet
     }
@@ -477,7 +477,7 @@ export class Orchestrator {
     // Load group memory
     let memory = '';
     try {
-      memory = await readGroupFile(groupId, 'CLAUDE.md');
+      memory = await readGroupFile(groupId, 'MEMORY.md');
     } catch {
       // No memory file yet — that's fine
     }
@@ -636,7 +636,7 @@ function buildSystemPrompt(assistantName: string, memory: string): string {
     '- **javascript**: Execute JavaScript code (lighter than bash).',
     '- **read_file** / **write_file** / **list_files**: Manage files in the group workspace.',
     '- **fetch_url**: Fetch any URL (no CORS restrictions — server-side proxy).',
-    '- **update_memory**: Save context to CLAUDE.md for future conversations.',
+    '- **update_memory**: Save context to MEMORY.md for future conversations.',
     '- **create_task**: Schedule recurring tasks with cron expressions.',
     '- **html_preview**: Render interactive HTML directly in chat (maps, charts, games, dashboards, etc).',
     '',

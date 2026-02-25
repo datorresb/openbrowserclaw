@@ -84,6 +84,23 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: 'web_search',
+    description:
+      'Search the web and return results (titles, URLs, snippets). ' +
+      'Use this when you need to find information, look up facts, or discover URLs. ' +
+      'Returns plain-text extracted results. For a specific known URL, use fetch_url instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The search query',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'fetch_url',
     description:
       'Fetch a URL via HTTP and return the response body. ' +
@@ -115,7 +132,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'update_memory',
     description:
-      'Update the CLAUDE.md memory file for this group. ' +
+      'Update the MEMORY.md memory file for this group. ' +
       'Use this to persist important context, user preferences, project state, ' +
       'and anything the agent should remember across conversations. ' +
       'This file is loaded as system context on every invocation.',
@@ -124,7 +141,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         content: {
           type: 'string',
-          description: 'New content for the CLAUDE.md memory file',
+          description: 'New content for the MEMORY.md memory file',
         },
       },
       required: ['content'],

@@ -5,11 +5,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Folder, Globe, Image, FileText, FileCode, FileJson, FileSpreadsheet,
-  File, Home, Search, Download, Trash2, X, FolderOpen,
+  File, Home, Search, Download, Trash2, X, FolderOpen, Archive,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import { zipSync, strToU8 } from 'fflate';
 import { DEFAULT_GROUP_ID } from '../../config.js';
-import { listGroupFiles, readGroupFile, deleteGroupFile } from '../../storage.js';
+import { listGroupFiles, readGroupFile, deleteGroupFile, collectAllGroupFiles } from '../../storage.js';
 import { FileViewerModal } from './FileViewerModal.js';
 
 interface FileEntry {
@@ -40,6 +41,8 @@ export function FilesPage() {
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [viewerFile, setViewerFile] = useState<{ name: string; content: string } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+
+  const [zipping, setZipping] = useState(false);
 
   const groupId = DEFAULT_GROUP_ID;
   const currentDir = path.length > 0 ? path.join('/') : '.';
@@ -109,10 +112,37 @@ export function FilesPage() {
     URL.revokeObjectURL(url);
   }
 
+  async function handleDownloadZip() {
+    setZipping(true);
+    try {
+      const files = await collectAllGroupFiles(groupId);
+      if (files.length === 0) {
+        setError('No files to download');
+        return;
+      }
+      const zipData: Record<string, Uint8Array> = {};
+      for (const f of files) {
+        zipData[f.path] = strToU8(f.content);
+      }
+      const zipped = zipSync(zipData, { level: 6 });
+      const blob = new Blob([zipped.buffer as ArrayBuffer], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `workspace-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError('Failed to create ZIP');
+    } finally {
+      setZipping(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-full">
       {/* Breadcrumbs */}
-      <div className="px-4 py-2 bg-base-200 border-b border-base-300">
+      <div className="px-4 py-2 bg-base-200 border-b border-base-300 flex items-center justify-between">
         <div className="breadcrumbs text-sm">
           <ul>
             <li>
@@ -135,6 +165,19 @@ export function FilesPage() {
             ))}
           </ul>
         </div>
+        <button
+          className="btn btn-ghost btn-sm gap-1"
+          onClick={handleDownloadZip}
+          disabled={zipping || entries.length === 0}
+          title="Download workspace as ZIP"
+        >
+          {zipping ? (
+            <span className="loading loading-spinner loading-xs" />
+          ) : (
+            <Archive className="w-4 h-4" />
+          )}
+          <span className="hidden sm:inline">ZIP</span>
+        </button>
       </div>
 
       {/* Content area */}
