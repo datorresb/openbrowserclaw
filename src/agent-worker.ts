@@ -272,8 +272,10 @@ async function handleInvoke(payload: InvokePayload): Promise<void> {
         //    Only accept text as final if it looks like a genuine completion (iteration > 2
         //    and we've already used tools — give the model 1 chance to self-correct)
         const isEmptyResponse = !cleaned;
-        const lastToolSignature = recentToolCalls[recentToolCalls.length - 1] || '';
-        const lastToolName = lastToolSignature.split(':', 1)[0];
+        const lastToolSignature = recentToolCalls.length > 0
+          ? recentToolCalls[recentToolCalls.length - 1]
+          : '';
+        const lastToolName = lastToolSignature ? lastToolSignature.split(':', 1)[0] : '';
         const isHtmlPreviewCompletionResponse = isHtmlPreviewCompletion(hasUsedTools, isEmptyResponse, lastToolName);
         const isMidTaskDescription = hasUsedTools && !isEmptyResponse && autoContinueCount < 2;
         const shouldNudge = autoContinueCount < MAX_AUTO_CONTINUES && (
